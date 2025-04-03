@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# Verifica que la variable de entorno OPENAI_API_KEY esté configurada
+if [ -z "$OPENAI_API_KEY" ]; then
+    echo "❌ ERROR: Debes configurar la variable de entorno OPENAI_API_KEY con tu clave de OpenAI API."
+    exit 1
+fi
+
+# Verifica que jq esté instalado
+if ! command -v jq &> /dev/null; then
+    echo "❌ ERROR: jq no está instalado. Instálalo con: sudo apt install jq"
+    exit 1
+fi
+
+# Verifica que el script se ejecuta dentro de un repositorio Git
+if [ ! -d ".git" ]; then
+    echo "❌ ERROR: Este script debe ejecutarse en la raíz de un repositorio Git."
+    exit 1
+fi
+
+# Obtiene el diff de archivos modificados pero no staged
+DIFF=$(git diff)
+
+# Añade contenido de archivos nuevos no añadidos (untracked)
+UNTRACKED=$(git ls-files --others --exclude-standard)
+for FILE in $UNTRACKED; do
+    if [ -f "$FILE" ]; then
+        CONTENT=$(cat "$FILE")
+        DIFF="$DIFF"$'\n\n'"# Untracked file: $FILE"$'\n'"$CONTENT"
+    fi
+done
+
+echo "📢 Analizando los cambios con GPT-4o-mini..."
+
+# Construye el prompt para GPT-4o-mini usando stdin en lugar de --arg
+PROMPT=$(jq -n '{
+  model: "gpt-4o-mini",
+  messages: [
+    {
+      role: "system",
+      content: "Eres un desarrollador senior con experiencia en análisis de código y buenas prácticas."
+    },
+    {
+      role: "user",
+      content: "Se te proporcionará un diff con los cambios recientes en un repositorio Git.\n\nTarea:\n1. Proporciona estrictamente un nombre para el commit que cumpla con las buenas prácticas y sea descriptivo de los cambios, al mismo tiempo simple y corto.\n\nAquí está el diff:\n\n'"$(cat)"'\n\nBuenas prácticas:\n- Nombre del commit en inglés, con el siguiente prefijo según el contexto:\n  - feat: Una nueva característica para el usuario.\n  - fix: Arregla un bug que afecta al usuario.\n  - perf: Cambios que mejoran el rendimiento del sitio.\n  - build: Cambios en el sistema de build, tareas de despliegue o instalación.\n  - ci: Cambios en la integración continua.\n  - docs: Cambios en la documentación.\n  - refactor: Refactorización del código como cambios de nombre de variables o funciones.\n  - style: Cambios de formato, tabulaciones, espacios o puntos y coma, etc; no afectan al usuario.\n  - test: Añade tests o refactoriza uno existente."
+    }
+  ],
+  max_tokens: 50
+}' <<< "$DIFF")
+
+# Llamada a la API de OpenAI con curl
+RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d "$PROMPT")
+
+# Verifica si la respuesta contiene un error
+if [ -z "$RESPONSE" ] || [ "$RESPONSE" == "null" ] || echo "$RESPONSE" | jq -e '.error' &> /dev/null; then
+    echo "❌ ERROR: La API de OpenAI devolvió una respuesta inválida o un error."
+    exit 1
+fi
+
+# Extrae el nombre del commit de la respuesta
+CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+
+# Verifica si el contenido es válido antes de mostrarlo
+if [ -z "$CONTENT" ] || [ "$CONTENT" == "null" ]; then
+    echo "❌ ERROR: GPT-4o-mini devolvió una respuesta vacía."
+    exit 1
+fi
+
+# Muestra el resultado
+echo -e "\n **Nombre del commit:**\n"
+echo "$CONTENT" | \
+  sed -E 's/^### (.*)/\n \1\n/' | \
+  sed -E 's/^## (.*)/\n \1\n/' | \
+  sed -E 's/^- (.*)/  ➜ \1/' | \
+  sed -E 's/\*\*(.*)\*\*/\033[1m\1\033[0m/g'
